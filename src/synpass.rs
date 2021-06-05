@@ -116,17 +116,17 @@ impl SynPass {
         }
         if formals != Value::make_nil() {
             if !formals.symbolp() {
-                return Err(format!(
-                    "variadic Expected symbol but found '{:?}'",
-                    formals.car()
-                ));
+                return Err(format!("Expected symbol but found '{:?}'", formals.car()));
             }
         }
         Ok(())
     }
     fn transform_define(&mut self, define: Value, data: Value) -> Result<Value, String> {
         if !data.consp() {
-            return Err(format!("expected (define (<variable> ...) <body>) or (define <variable> <expr>), found '{:?}'",data));
+            return Err(format!(
+                "expected (define <variable> <expr>), found '{:?}'",
+                data
+            ));
         }
 
         let data = data.cons();

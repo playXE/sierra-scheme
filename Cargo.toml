@@ -8,6 +8,7 @@ edition = "2018"
 [dependencies]
 logos = "0.12.0"
 unescape = "0.1.0"
+parking_lot = "0.11.1"
 cranelift = "0.74.0"
 cranelift-jit = "0.74.0"
 cranelift-module = "0.74.0"

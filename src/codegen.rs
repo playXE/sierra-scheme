@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+/*use std::collections::HashMap;
 
 use crate::Value as ScmVal;
 use crate::{gc::Gc, ScmHashtable, ScmObj, ScmType};
@@ -67,3 +67,4 @@ impl<'a> Translator<'a> {
         self.builder.block_params(merge_block)[0]
     }
 }
+*/

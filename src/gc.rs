@@ -3,9 +3,9 @@ use std::{
     alloc::Layout,
     fmt,
     hash::{Hash, Hasher},
-    marker::{PhantomData, Unsize},
+    marker::PhantomData,
     mem::{forget, ManuallyDrop, MaybeUninit},
-    ops::{CoerceUnsized, Deref, DerefMut, DispatchFromDyn},
+    ops::{Deref, DerefMut},
     ptr::NonNull,
     u128,
 };
@@ -89,16 +89,6 @@ struct GcPointer<T: ?Sized + GcObject>(NonNull<GcBox<T>>);
 
 unsafe impl<T: GcObject> Send for GcPointer<T> {}
 unsafe impl<T: GcObject> Sync for GcPointer<T> {}
-
-impl<T: ?Sized + Unsize<U> + Send + GcObject, U: ?Sized + Send + GcObject> CoerceUnsized<Gc<U>>
-    for Gc<T>
-{
-}
-
-impl<T: ?Sized + Unsize<U> + Send + GcObject, U: ?Sized + Send + GcObject>
-    CoerceUnsized<GcPointer<U>> for GcPointer<T>
-{
-}
 
 impl<T: Send + GcObject> Gc<T> {
     pub fn raw(self) -> *mut T {
@@ -297,6 +287,7 @@ impl<T: GcObject> GcBox<T> {
             NonNull::new_unchecked(base_ptr as *mut GcBox<MaybeUninit<T>>)
         }
     }
+    #[allow(dead_code)]
     fn new_from_layout_atomic(layout: Layout) -> NonNull<GcBox<u8>> {
         unsafe {
             let base_ptr = GC_malloc_atomic(layout.size()) as *mut usize; //ALLOCATOR.allocate(layout).unwrap().as_ptr() as *mut usize;
@@ -444,5 +435,22 @@ mod test {
 pub fn collect_garbage() {
     unsafe {
         GC_gcollect();
+    }
+}
+
+use std::alloc::GlobalAlloc;
+
+pub struct GC;
+
+unsafe impl GlobalAlloc for GC {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        GC_malloc(layout.size())
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, _layout: Layout) {
+        GC_free(ptr);
+    }
+    unsafe fn realloc(&self, ptr: *mut u8, _layout: Layout, new_size: usize) -> *mut u8 {
+        GC_realloc(ptr, new_size)
     }
 }

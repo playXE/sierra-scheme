@@ -21,7 +21,7 @@ where
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
 
-    let out_dir = env::var("OUT_DIR").unwrap();
+    /* let out_dir = env::var("OUT_DIR").unwrap();
     let mut boehm_src = PathBuf::from(out_dir);
     boehm_src.push(BOEHM_DIR);
     if !boehm_src.exists() {
@@ -38,7 +38,13 @@ fn main() {
         env::set_current_dir(&boehm_src).unwrap();
         run("cmake", |cmd| cmd.arg("."));
         run("cmake", |cmd| {
-            cmd.args(&["--build", ".", "--config", "Release"])
+            cmd.args(&[
+                "--build",
+                ".",
+                "--config",
+                "Release",
+                "-DIGNORE_DYNAMIC_LOADING.",
+            ])
         });
     }
     let libpath = PathBuf::from(&boehm_src);
@@ -66,6 +72,6 @@ fn main() {
     for entry in std::fs::read_dir(&libpath).unwrap() {
         println!("-entry {:?}", entry.unwrap().path());
     }
-    println!("link to {}", libpath.display());
+    println!("link to {}", libpath.display());*/
     println!("cargo:rustc-link-lib=gc");
 }

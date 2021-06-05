@@ -1,5 +1,4 @@
-#![feature(coerce_unsized, unsize, dispatch_from_dyn, allocator_api)]
-
+use parking_lot::{lock_api::RawMutex, RawMutex as Lock};
 use std::{
     collections::hash_map::DefaultHasher,
     fmt::{self, Debug, Formatter},
@@ -8,15 +7,19 @@ use std::{
     ops::{Deref, Index, IndexMut},
     ptr::null_mut,
 };
+use vm::scm_thread;
 
 use dashmap::DashMap;
 use gc::{GC_malloc, GC_malloc_atomic, GC_realloc, Gc, GcObject};
 #[macro_use]
 pub mod macros;
+pub mod builtins;
 pub mod codegen;
+pub mod function;
 pub mod gc;
 pub mod macro_expander;
 pub mod synpass;
+pub mod vm;
 /// Scheme value encoding.
 ///
 /// This struct simply allows us to put fixnum value on stack instead of allocating it on the heap.
@@ -31,6 +34,22 @@ pub struct Value {
 }
 
 impl Value {
+    pub fn to_bool(self) -> bool {
+        if self.nilp() {
+            false
+        } else if self == Value::make_false() {
+            false
+        } else if self.fixnump() && self.fixnum() == 0 {
+            false
+        } else if self.realp() && self.real() == 0.0 {
+            false
+        } else {
+            true
+        }
+    }
+    pub fn nilp(self) -> bool {
+        self == Value::make_nil()
+    }
     pub fn car(self) -> Self {
         self.cons().car
     }
@@ -228,6 +247,13 @@ pub enum ScmType {
     Macro,
     HashNode,
     HashTable,
+    BVector,
+    Closure,
+    NativeClosure,
+    /// Macro written in native Rust code.
+    NativeMacro,
+    CompileError,
+    RuntimeError,
 }
 pub struct Header {
     pub ty: ScmType,
@@ -248,6 +274,7 @@ pub struct ScmHashtable {
     pub hdr: Header,
     pub nodes: Gc<ScmVector>,
     pub count: usize,
+    pub mutex: Lock,
 
     pub eqv: fn(Value, Value) -> bool,
     pub hash: fn(Value, &mut dyn Hasher),
@@ -266,9 +293,20 @@ impl ScmHashtable {
             hdr: Header::new(ScmType::HashTable),
             eqv,
             count: 0,
+            mutex: Lock::INIT,
             nodes: ScmVector::new_nil(size),
             hash: compute,
         })
+    }
+
+    pub fn lock(&self) {
+        self.mutex.lock();
+    }
+
+    pub fn unlock(&self) {
+        unsafe {
+            self.mutex.unlock();
+        }
     }
 
     pub fn resize(&mut self) {
@@ -278,6 +316,7 @@ impl ScmHashtable {
             eqv: self.eqv,
             count: 0,
             hash: self.hash,
+            mutex: Lock::INIT,
             hdr: Header::new(ScmType::HashTable),
         };
         let mut node;
@@ -325,13 +364,15 @@ impl ScmHashtable {
         (self.hash)(key, &mut hasher);
         let hash = hasher.finish();
         let mut position = (hash % self.nodes.size as u64) as usize;
-        let node = self.nodes[position];
+        let mut node = self.nodes[position];
+
         while node != Value::make_nil() {
             if node.hashnode().hash == hash && (self.eqv)(key, node.hashnode().key) {
                 let prev = node.hashnode().value;
                 node.hashnode().value = val;
                 return (true, prev);
             }
+            node = node.hashnode().next;
         }
         if self.count >= (self.nodes.size as f64 * 0.75) as usize {
             self.resize();
@@ -535,6 +576,16 @@ impl IndexMut<usize> for ScmVector {
     }
 }
 impl ScmVector {
+    pub fn slice_from(&self, from: usize) -> &[Value] {
+        unsafe { std::slice::from_raw_parts(self.elts.add(from), self.size - from) }
+    }
+    pub fn size(&self) -> usize {
+        self.size
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
     pub fn new(count: usize) -> Gc<Self> {
         unsafe {
             let pointer = GC_malloc(count * size_of::<Value>()).cast::<Value>();
@@ -574,6 +625,7 @@ impl ScmVector {
             }
         }
     }
+    #[cold]
     #[inline(never)]
     unsafe fn push_slow(&mut self, value: Value) {
         let pointer =
@@ -666,6 +718,11 @@ static mut _FALSE: Value = Value::make_fixnum(0);
 static mut _SYMTAB: MaybeUninit<SymbolTable> = MaybeUninit::uninit();
 pub fn scm_init() {
     unsafe {
+        extern "C" {
+            fn GC_init();
+        }
+
+        GC_init();
         _SYMTAB = MaybeUninit::new(SymbolTable::new());
         _NIL = Value::make_pointer(Gc::new(ScmObj {
             hdr: Header::new(ScmType::Nil),
@@ -898,8 +955,22 @@ fn print(f: &mut Formatter, val: Value, seen: &mut HashSet<usize>) -> fmt::Resul
         write!(f, "{}", &**val.string())
     } else if val.symbolp() {
         write!(f, "{}", val.symbol().str())
+    } else if val.pointerp() && val.pointer().hdr.ty == ScmType::CompileError {
+        write!(
+            f,
+            "<compile-error: '{}'>",
+            val.ptr::<ScmCompileError>().msg.as_str()
+        )
+    } else if val.pointerp() && val.pointer().hdr.ty == ScmType::RuntimeError {
+        write!(
+            f,
+            "<runtime-error: '{}'>",
+            val.ptr::<ScmRuntimeError>().msg.as_str()
+        )
+    } else if val.closurep() {
+        write!(f, "#closure<{:x}>", val.raw())
     } else {
-        write!(f, "<todo>{:x}", val.raw())
+        write!(f, "<todo> {:x}", val.raw())
     }
 }
 
@@ -933,14 +1004,11 @@ impl Debug for Value {
     }
 }
 
-pub struct VM {
-    pub environment: Gc<ScmHashtable>,
-    pub last_error: Value,
-}
 impl VM {
     pub fn new() -> Self {
         Self {
             last_error: Value::make_nil(),
+            disasm: false,
             environment: ScmHashtable::new(64, None, None),
         }
     }
@@ -996,12 +1064,15 @@ pub extern "C" fn vm() -> &'static mut VM {
 #[no_mangle]
 pub extern "C" fn vm_raise(error: Value) -> ! {
     vm().last_error = error;
+    scm_thread().last_error = error;
     std::panic::resume_unwind(Box::new(SchemeError));
 }
 
 #[no_mangle]
 pub extern "C" fn vm_global_lookup(name: Value) -> Value {
+    vm().environment.lock();
     let (found, value) = vm().environment.lookup(name);
+    vm().environment.unlock();
     if !found {
         vm_raise(Value::make_pointer(ScmString::new(format!(
             "Variable '{:?}' not found",
@@ -1013,7 +1084,10 @@ pub extern "C" fn vm_global_lookup(name: Value) -> Value {
 
 #[no_mangle]
 pub extern "C" fn vm_global_set(name: Value, value: Value) -> Value {
-    let (found, value) = vm().environment.insert(name, value);
+    let vm = vm();
+    vm.environment.lock();
+    let (found, value) = vm.environment.insert(name, value);
+    vm.environment.unlock();
     if !found {
         vm_raise(Value::make_pointer(ScmString::new(format!(
             "Variable '{:?}' not found",
@@ -1022,3 +1096,167 @@ pub extern "C" fn vm_global_set(name: Value, value: Value) -> Value {
     }
     value
 }
+
+#[no_mangle]
+pub extern "C" fn vm_global_insert(name: Value, value: Value) -> Value {
+    let vm = vm();
+    vm.environment.lock();
+    let (_found, value) = vm.environment.insert(name, value);
+    vm.environment.unlock();
+
+    value
+}
+#[repr(C)]
+pub struct ScmBVector {
+    pub hdr: Header,
+    pub size: usize,
+    pub capacity: usize,
+    pub elts: *mut u8,
+}
+unsafe impl Send for ScmBVector {}
+impl GcObject for ScmBVector {}
+impl ScmBVector {
+    pub fn new(count: usize) -> Gc<Self> {
+        unsafe {
+            let pointer = GC_malloc_atomic(count);
+            Gc::new(Self {
+                hdr: Header::new(ScmType::BVector),
+                capacity: count,
+                size: 0,
+                elts: pointer,
+            })
+        }
+    }
+    pub fn new_zeroed(count: usize) -> Gc<Self> {
+        unsafe {
+            let pointer = GC_malloc_atomic(count);
+            let mut this = Gc::new(Self {
+                hdr: Header::new(ScmType::Vector),
+                capacity: count,
+                size: 0,
+                elts: pointer,
+            });
+            std::ptr::write_bytes(this.elts, 0, count);
+            this.size = count;
+            this
+        }
+    }
+    pub fn size(&self) -> usize {
+        self.size
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    pub fn resize(&mut self, new_size: usize) {
+        if new_size > self.size {
+            for _ in self.size..new_size {
+                self.push(0);
+            }
+        } else {
+            for _ in (new_size..self.size).rev() {
+                self.pop_back();
+            }
+        }
+    }
+    #[inline]
+    pub fn push(&mut self, value: u8) {
+        if self.size < self.capacity {
+            unsafe {
+                self.elts.add(self.size).write(value);
+                self.size += 1;
+            }
+        } else {
+            unsafe {
+                self.push_slow(value);
+            }
+        }
+    }
+    #[inline(never)]
+    unsafe fn push_slow(&mut self, value: u8) {
+        let pointer = GC_realloc(
+            self.elts.cast(),
+            (self.capacity as f64 * 1.25).round() as usize,
+        )
+        .cast::<u8>();
+        self.elts = pointer;
+        self.capacity += 1;
+        self.push(value);
+    }
+
+    pub fn pop_back(&mut self) -> Option<u8> {
+        let sz = self.size;
+        if sz == 0 {
+            return None;
+        }
+        unsafe {
+            let val = self.elts.add(sz - 1).read();
+            self.size -= 1;
+            Some(val)
+        }
+    }
+}
+
+#[repr(C)]
+pub struct ScmCompileError {
+    pub hdr: Header,
+    pub msg: Gc<ScmString>,
+}
+impl GcObject for ScmCompileError {}
+impl ScmCompileError {
+    pub fn new(msg: impl AsRef<str>) -> Gc<Self> {
+        Gc::new(Self {
+            hdr: Header::new(ScmType::CompileError),
+            msg: ScmString::new(msg),
+        })
+    }
+}
+
+impl Index<usize> for ScmBVector {
+    type Output = u8;
+    fn index(&self, index: usize) -> &Self::Output {
+        unsafe { &*self.elts.add(index) }
+    }
+}
+
+impl IndexMut<usize> for ScmBVector {
+    fn index_mut(&mut self, index: usize) -> &mut Self::Output {
+        unsafe { &mut *self.elts.add(index) }
+    }
+}
+#[repr(C)]
+pub struct ScmRuntimeError {
+    pub hdr: Header,
+    pub msg: Gc<ScmString>,
+}
+impl GcObject for ScmRuntimeError {}
+impl ScmRuntimeError {
+    pub fn new(msg: impl AsRef<str>) -> Gc<Self> {
+        Gc::new(Self {
+            hdr: Header::new(ScmType::RuntimeError),
+            msg: ScmString::new(msg),
+        })
+    }
+}
+
+pub struct VM {
+    pub environment: Gc<ScmHashtable>,
+    pub last_error: Value,
+    pub disasm: bool,
+}
+
+#[repr(C)]
+pub struct ScmNative {
+    pub hdr: Header,
+    pub clos: fn(&[Value]) -> Value,
+}
+impl ScmNative {
+    pub fn new(clos: fn(&[Value]) -> Value) -> Gc<Self> {
+        Gc::new(Self {
+            hdr: Header::new(ScmType::NativeClosure),
+            clos,
+        })
+    }
+}
+impl GcObject for ScmNative {}
