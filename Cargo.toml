@@ -5,8 +5,10 @@ edition = "2018"
 
 
 [dependencies]
-cranelift = "0.74.0"
-cranelift-jit = "0.74.0"
-cranelift-module = "0.74.0"
+cranelift = "0.75.0"
+cranelift-jit = "0.75.0"
+cranelift-module = "0.75.0"
 mopa = "0.2.2"
-tagged-box = { version = "0.1", features = ["56bits"] }
+libc = "0.2"
+libmimalloc-sys = { version = "0.1.21", features = ["extended"] }
+tagged-box = { version = "0.1", default-features = false, features = ["56bits"] }

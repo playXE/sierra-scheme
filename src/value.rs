@@ -1,4 +1,7 @@
 use crate::gc::*;
+use cons::*;
+
+use self::symbol::Symbol;
 pub type TagKind = u32;
 pub const CMP_FALSE: i32 = 0;
 pub const CMP_TRUE: i32 = 1;
@@ -247,5 +250,77 @@ impl Value {
 
     pub fn is_number(&self) -> bool {
         self.is_double() || self.is_int32()
+    }
+
+    pub fn as_cons_or_null(self) -> Option<GcPointer<Cons>> {
+        if self.is_object() {
+            self.get_object().downcast()
+        } else {
+            None
+        }
+    }
+    /// Returns true if the value is a cons cell
+    pub fn is_cons(&self) -> bool {
+        self.is_object() && self.get_object().is::<Cons>()
+    }
+    /// Returns true if the value is an atom, ie. not a cons cell
+    pub fn is_atom(&self) -> bool {
+        !self.is_cons()
+    }
+
+    /// Returns true if the value is a properly null-terminated cons list
+    pub fn is_list(&self) -> bool {
+        if self.is_null() {
+            return true;
+        }
+
+        let mut cons = self.as_cons_or_null();
+        while let Some(c) = cons {
+            if c.rest.is_null() {
+                return true;
+            }
+            cons = c.rest.as_cons_or_null();
+        }
+        false
+    }
+    /// Returns the number of cons cells in the list, starting at value. O(n) operation.
+    ///
+    /// ## TODO
+    /// We might need to also check if value is a vector and return vector length.
+    pub fn length(&self) -> Option<usize> {
+        self.as_cons_or_null().map(|x| x.length())
+    }
+
+    pub fn as_symbol(self) -> Result<GcPointer<Symbol>, SchemeError> {
+        if self.is_object() && self.get_object().is::<Symbol>() {
+            Ok(unsafe { self.get_object().downcast_unchecked() })
+        } else {
+            Err(SchemeError::new(
+                "Value type was expected to be a symbol".to_owned(),
+            ))
+        }
+    }
+}
+unsafe impl Trace for Value {
+    fn trace(&self, visitor: &mut Tracer) {
+        if self.is_pointer() && !self.is_empty() {
+            self.get_object().trace(visitor);
+        }
+    }
+}
+pub mod closure;
+pub mod cons;
+pub mod environment;
+pub mod instruction;
+pub mod macro_;
+pub mod package;
+pub mod symbol;
+pub struct SchemeError {
+    pub msg: String,
+}
+
+impl SchemeError {
+    pub fn new(msg: String) -> Self {
+        Self { msg }
     }
 }

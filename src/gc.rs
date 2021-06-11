@@ -1,8 +1,20 @@
+use libmimalloc_sys::mi_heap_check_owned;
+use libmimalloc_sys::mi_heap_contains_block;
+use libmimalloc_sys::mi_heap_malloc_aligned;
+use libmimalloc_sys::mi_heap_new;
+use libmimalloc_sys::mi_heap_t;
 use std::any::TypeId;
+use std::cell::Cell;
+use std::collections::HashMap;
+use std::hash::Hash;
+use std::hash::Hasher;
 use std::marker::PhantomData;
+use std::mem::replace;
 use std::mem::size_of;
 use std::ops::Deref;
 use std::ops::DerefMut;
+use std::pin::Pin;
+use std::ptr::null_mut;
 use std::ptr::NonNull;
 use tagged_box::*;
 
@@ -25,7 +37,52 @@ impl<T: GcCell> DerefMut for Handle<T> {
     }
 }
 
-pub struct Tracer {}
+pub struct Tracer {
+    queue: Vec<*mut GcPointerBase>,
+    cons_roots: Vec<(usize, usize)>,
+}
+impl Tracer {
+    pub fn visit_raw(&mut self, cell: *mut GcPointerBase) -> GcPointer<dyn GcCell> {
+        let base = cell;
+        unsafe {
+            if !(*base).set_state(DEFINETELY_WHITE, POSSIBLY_GREY) {
+                return GcPointer {
+                    base: NonNull::new_unchecked(base as *mut _),
+                    marker: Default::default(),
+                };
+            }
+
+            //prefetch_read_data(base, 1);
+            self.queue.push(base as *mut _);
+            GcPointer {
+                base: NonNull::new_unchecked(base as *mut _),
+                marker: Default::default(),
+            }
+        }
+    }
+
+    pub fn visit(&mut self, cell: GcPointer<dyn GcCell>) -> GcPointer<dyn GcCell> {
+        unsafe {
+            let base = cell.base.as_ptr();
+            if !(*base).set_state(DEFINETELY_WHITE, POSSIBLY_GREY) {
+                return cell;
+            }
+
+            // prefetch_read_data(base, 1);
+            self.queue.push(base);
+            cell
+        }
+    }
+    /// Add address range to scan for conservative roots.
+    ///
+    /// ## TODO
+    /// Add an assertion so this function panics when someone invokes it while GC processes worklist.
+    ///
+    ///
+    pub fn add_conservative(&mut self, from: usize, to: usize) {
+        self.cons_roots.push((from, to));
+    }
+}
 
 /// Indicates that a type can be traced by a garbage collector.
 ///
@@ -61,7 +118,7 @@ pub unsafe trait Trace {
     ///       and it'll always be completely sufficient for safe code (aside from destructors).
     ///     - With an automatically derived implementation you will never miss a field
     /// - Invoking this function directly.
-    fn trace(&mut self, visitor: &mut Tracer) {
+    fn trace(&self, visitor: &mut Tracer) {
         let _ = visitor;
     }
 }
@@ -275,7 +332,7 @@ impl ShadowStack {
 }
 
 unsafe impl Trace for ShadowStack {
-    fn trace(&mut self, visitor: &mut dyn Tracer) {
+    fn trace(&self, visitor: &mut Tracer) {
         unsafe {
             let mut head = *self.head.as_ptr();
             while !head.is_null() {
@@ -406,5 +463,221 @@ impl<'a, T: Trace> DerefMut for Rooted<'a, '_, T> {
         unsafe {
             &mut std::mem::transmute_copy::<_, &mut RootedInternal<T>>(&mut self.pinned).value
         }
+    }
+}
+
+pub struct GarbageCollector {
+    heap: *mut mi_heap_t,
+    allocated: usize,
+    threshold: usize,
+    callbacks: Vec<Box<dyn FnMut(&mut Tracer)>>,
+}
+
+impl GarbageCollector {
+    pub fn new() -> Self {
+        Self {
+            threshold: 128 * 1024,
+            allocated: 0,
+            heap: unsafe { mi_heap_new() },
+            callbacks: vec![],
+        }
+    }
+
+    pub fn add_callback(&mut self, cb: Box<dyn FnMut(&mut Tracer)>) {
+        self.callbacks.push(cb);
+    }
+    #[inline(never)]
+    pub fn collect_garbage(&mut self) {
+        let mut tracer = Tracer {
+            queue: Vec::with_capacity(128),
+            cons_roots: Vec::with_capacity(4),
+        };
+        let mut callbacks = replace(&mut self.callbacks, vec![]);
+        for cb in callbacks.iter_mut() {
+            cb(&mut tracer);
+        }
+        self.callbacks = callbacks;
+
+        self.process_cons_roots(&mut tracer);
+        self.process_queue(&mut tracer);
+
+        self.allocated = 0;
+        unsafe {
+            libmimalloc_sys::mi_heap_visit_blocks(
+                self.heap,
+                true,
+                Some(sweep),
+                self as *mut Self as _,
+            );
+
+            if self.allocated > self.threshold {
+                self.threshold = (self.allocated as f64 * 1.5f64) as usize;
+            }
+            libmimalloc_sys::mi_heap_collect(self.heap, false);
+        }
+    }
+    pub fn safepoint(&mut self) {
+        if self.allocated >= self.threshold {
+            self.collect_garbage();
+        }
+    }
+    pub fn allocate<T: GcCell>(&mut self, value: T) -> GcPointer<T> {
+        let size = value.compute_size() + size_of::<GcPointerBase>();
+
+        unsafe {
+            self.allocated += size;
+            let ptr = mi_heap_malloc_aligned(self.heap, size, 16).cast::<GcPointerBase>();
+            ptr.write(GcPointerBase::new(vtable_of(&value), TypeId::of::<T>()));
+
+            (*ptr).data::<T>().write(value);
+            GcPointer {
+                marker: PhantomData,
+                base: NonNull::new_unchecked(ptr),
+            }
+        }
+    }
+
+    fn process_cons_roots(&mut self, tracer: &mut Tracer) {
+        while let Some((from, to)) = tracer.cons_roots.pop() {
+            unsafe {
+                let mut scan = from as *mut *mut u8;
+                let end = to as *mut *mut u8;
+                while scan < end {
+                    let ptr = scan.read();
+                    if mi_heap_check_owned(self.heap, ptr.cast()) {
+                        if mi_heap_contains_block(self.heap, ptr.cast()) {
+                            tracer.visit_raw(ptr.cast());
+                        }
+                    }
+
+                    scan = scan.add(1);
+                }
+            }
+        }
+    }
+
+    fn process_queue(&mut self, tracer: &mut Tracer) {
+        while let Some(ptr) = tracer.queue.pop() {
+            unsafe {
+                (*ptr).set_state(POSSIBLY_GREY, POSSIBLY_BLACK);
+                (*ptr).get_dyn().trace(tracer);
+            }
+        }
+    }
+}
+
+#[allow(dead_code)]
+unsafe extern "C" fn sweep(
+    _heap: *const libmimalloc_sys::mi_heap_t,
+    _area: *const libmimalloc_sys::mi_heap_area_t,
+    block: *mut libc::c_void,
+    block_sz: usize,
+    arg: *mut libc::c_void,
+) -> bool {
+    // weird, mimalloc passes NULL pointer at first iteration.
+    if block.is_null() {
+        return true;
+    }
+    let gc = &mut *(arg.cast::<GarbageCollector>());
+    let ptr = block.cast::<GcPointerBase>();
+    if (*ptr).state() == DEFINETELY_WHITE {
+        std::ptr::drop_in_place((*ptr).get_dyn());
+        libmimalloc_sys::mi_free(ptr.cast());
+    } else {
+        gc.allocated += block_sz;
+        assert!((*ptr).set_state(POSSIBLY_BLACK, DEFINETELY_WHITE));
+    }
+
+    true
+}
+
+impl Drop for GarbageCollector {
+    fn drop(&mut self) {
+        unsafe {
+            libmimalloc_sys::mi_heap_visit_blocks(
+                self.heap,
+                true,
+                Some(sweep),
+                self as *mut Self as _,
+            );
+            libmimalloc_sys::mi_heap_destroy(self.heap);
+        }
+    }
+}
+
+unsafe impl<T: Trace> Trace for Vec<T> {
+    fn trace(&self, visitor: &mut Tracer) {
+        for val in self.iter() {
+            val.trace(visitor);
+        }
+    }
+}
+
+impl<T: Trace + 'static> GcCell for Vec<T> {}
+unsafe impl<T: GcCell + ?Sized> Trace for GcPointer<T> {
+    fn trace(&self, visitor: &mut Tracer) {
+        visitor.visit(self.as_dyn());
+    }
+}
+impl<T: GcCell> Deref for GcPointer<T> {
+    type Target = T;
+    fn deref(&self) -> &Self::Target {
+        unsafe { &*(&*self.base.as_ptr()).data::<T>() }
+    }
+}
+impl<T: GcCell> DerefMut for GcPointer<T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        unsafe { &mut *(&*self.base.as_ptr()).data::<T>() }
+    }
+}
+
+impl<T: GcCell> std::fmt::Pointer for GcPointer<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:p}", self.base)
+    }
+}
+
+impl<T: GcCell + std::fmt::Debug> std::fmt::Debug for GcPointer<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:?}", **self)
+    }
+}
+impl<T: GcCell + std::fmt::Display> std::fmt::Display for GcPointer<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", **self)
+    }
+}
+
+unsafe impl<K: Trace, V: Trace> Trace for HashMap<K, V> {
+    fn trace(&self, visitor: &mut Tracer) {
+        for (key, value) in self.iter() {
+            key.trace(visitor);
+            value.trace(visitor);
+        }
+    }
+}
+
+impl<K: Eq + std::hash::Hash + Trace + 'static, V: Trace + 'static> GcCell for HashMap<K, V> {}
+unsafe impl<T: Trace> Trace for Option<T> {
+    fn trace(&self, visitor: &mut Tracer) {
+        match self {
+            Some(val) => val.trace(visitor),
+            _ => (),
+        }
+    }
+}
+impl<T: Trace + 'static> GcCell for Option<T> {}
+
+impl<T: Hash + GcCell> Hash for GcPointer<T> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        T::hash(&**self, state);
+    }
+}
+
+impl<T: Eq + GcCell> Eq for GcPointer<T> {}
+
+impl<T: PartialEq + GcCell> PartialEq for GcPointer<T> {
+    fn eq(&self, other: &Self) -> bool {
+        T::eq(&**self, &**other)
     }
 }
