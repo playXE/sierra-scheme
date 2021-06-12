@@ -1,4 +1,4 @@
-use crate::gc::{GcPointer, Trace, Tracer};
+use crate::gc::{GcCell, GcPointer, Trace, Tracer};
 
 use super::{cons::Cons, environment::Environment, instruction::CodeBlock};
 
@@ -15,3 +15,4 @@ unsafe impl Trace for Closure {
         self.env.trace(visitor);
     }
 }
+impl GcCell for Closure {}

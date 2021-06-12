@@ -1,7 +1,7 @@
 use crate::gc::*;
 use cons::*;
 
-use self::symbol::Symbol;
+use self::{closure::Closure, macro_::Macro, package::Package, symbol::Symbol, vector::Vector};
 pub type TagKind = u32;
 pub const CMP_FALSE: i32 = 0;
 pub const CMP_TRUE: i32 = 1;
@@ -300,6 +300,45 @@ impl Value {
             ))
         }
     }
+    pub fn as_vector_or_null(self) -> Option<GcPointer<Vector>> {
+        if self.is_object() && self.get_object().is::<Vector>() {
+            Some(unsafe { self.get_object().downcast_unchecked() })
+        } else {
+            None
+        }
+    }
+
+    pub fn as_symbol_or_null(self) -> Option<GcPointer<Symbol>> {
+        if self.is_object() && self.get_object().is::<Symbol>() {
+            Some(unsafe { self.get_object().downcast_unchecked() })
+        } else {
+            None
+        }
+    }
+
+    pub fn as_closure_or_null(self) -> Option<GcPointer<Closure>> {
+        if self.is_object() && self.get_object().is::<Closure>() {
+            Some(unsafe { self.get_object().downcast_unchecked() })
+        } else {
+            None
+        }
+    }
+
+    pub fn as_macro_or_null(self) -> Option<GcPointer<Macro>> {
+        if self.is_object() && self.get_object().is::<Macro>() {
+            Some(unsafe { self.get_object().downcast_unchecked() })
+        } else {
+            None
+        }
+    }
+
+    pub fn as_package_or_null(self) -> Option<GcPointer<Package>> {
+        if self.is_object() && self.get_object().is::<Package>() {
+            Some(unsafe { self.get_object().downcast_unchecked() })
+        } else {
+            None
+        }
+    }
 }
 unsafe impl Trace for Value {
     fn trace(&self, visitor: &mut Tracer) {
@@ -315,6 +354,7 @@ pub mod instruction;
 pub mod macro_;
 pub mod package;
 pub mod symbol;
+pub mod vector;
 pub struct SchemeError {
     pub msg: String,
 }

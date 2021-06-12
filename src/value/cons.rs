@@ -19,6 +19,38 @@ impl Cons {
     pub fn new(gc: &mut GarbageCollector, first: Value, rest: Value) -> GcPointer<Self> {
         gc.allocate(Self { first, rest })
     }
+    pub fn make_list(gc: &mut GarbageCollector, values: impl Iterator<Item = Value>) -> Value {
+        let mut first = None;
+        let mut last: Option<GcPointer<Cons>> = None;
+        for value in values {
+            let newcell = Cons::new(gc, value, Value::encode_null_value());
+            if first.is_none() {
+                first = Some(newcell);
+            } else {
+                last.unwrap().rest = Value::encode_object_value(newcell);
+            }
+            last = Some(newcell);
+        }
+
+        if first.is_none() {
+            Value::encode_null_value()
+        } else {
+            Value::encode_object_value(first.unwrap())
+        }
+    }
+
+    pub fn to_vec(mut element: Value) -> Result<Vec<Value>, ConsToNativeError> {
+        let mut results = vec![];
+        while !element.is_null() {
+            if !element.is_cons() {
+                return Err(ConsToNativeError);
+            }
+            let cons = element.as_cons_or_null().unwrap();
+            results.push(cons.first);
+            element = cons.rest;
+        }
+        Ok(results)
+    }
 }
 
 impl GcPointer<Cons> {
@@ -73,39 +105,6 @@ impl GcPointer<Cons> {
 
     pub fn after_third(&self) -> Option<Value> {
         self.get_nth_cons(2).map(|x| x.rest)
-    }
-
-    pub fn make_list(gc: &mut GarbageCollector, values: impl Iterator<Item = Value>) -> Value {
-        let mut first = None;
-        let mut last: Option<GcPointer<Cons>> = None;
-        for value in values {
-            let newcell = Cons::new(gc, value, Value::encode_null_value());
-            if first.is_none() {
-                first = Some(newcell);
-            } else {
-                last.unwrap().rest = Value::encode_object_value(newcell);
-            }
-            last = Some(newcell);
-        }
-
-        if first.is_none() {
-            Value::encode_null_value()
-        } else {
-            Value::encode_object_value(first.unwrap())
-        }
-    }
-
-    pub fn to_vec(mut element: Value) -> Result<Vec<Value>, ConsToNativeError> {
-        let mut results = vec![];
-        while !element.is_null() {
-            if !element.is_cons() {
-                return Err(ConsToNativeError);
-            }
-            let cons = element.as_cons_or_null().unwrap();
-            results.push(cons.first);
-            element = cons.rest;
-        }
-        Ok(results)
     }
 }
 
